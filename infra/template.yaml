@@ -1,0 +1,1031 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Unified stack: CI/CD pipeline (CodePipeline + CodeBuild) to build the
+  GitHub Actions runner Docker image and push to ECR, plus org-wide
+  ephemeral self-hosted runners on Fargate triggered via GitHub webhooks.
+  Architecture: GitHub webhook -> API Gateway -> WebhookReceiver Lambda
+  (validates HMAC, enqueues) -> SQS Queue -> TaskLauncher Lambda
+  (rate-controlled) -> ECS RunTask.
+
+Parameters:
+  # ---- General ----
+  EnvironmentName:
+    Type: String
+    Default: dev
+    Description: Environment name.
+    AllowedValues: [dev, demo, qa, sdlc, prod, preprod]
+
+  # ---- CI/CD Pipeline ----
+  RepositoryName:
+    Type: String
+    Default: github-actions-runner
+    Description: Name of the ECR repository for the runner image.
+  GitHubOwner:
+    Type: String
+    Description: GitHub repository owner (user or org).
+  GitHubRepo:
+    Type: String
+    Default: Github-Runners
+    Description: GitHub repository name (source code for the Docker image).
+  GitHubBranch:
+    Type: String
+    Default: main
+    Description: Branch to track for CI/CD.
+  CodeStarConnectionArn:
+    Type: String
+    Description: ARN of the CodeStar Connection to GitHub (must be AVAILABLE).
+  GHRunnerVersion:
+    Type: String
+    Default: '2.336.0'
+    Description: GitHub Actions runner version to build.
+  GitHubBuildToken:
+    Type: String
+    NoEcho: true
+    Default: ''
+    Description: GitHub PAT (no scopes needed) to avoid API rate limits during Docker image builds.
+
+  # ---- Runner Infrastructure ----
+  ECSClusterName:
+    Type: String
+    Default: LINC
+    Description: Name of the EXISTING ECS cluster for runner tasks.
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC where Fargate runner tasks will run.
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnets with NAT Gateway route for Fargate tasks.
+  AssignPublicIp:
+    Type: String
+    Default: DISABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: DISABLED for private subnets with NAT. ENABLED for public subnets.
+  GitHubOrg:
+    Type: String
+    Description: GitHub organization name.
+    AllowedPattern: .+
+  GitHubPAT:
+    Type: String
+    NoEcho: true
+    Description: GitHub PAT with admin:org scope for runner self-registration.
+  GitHubWebhookSecret:
+    Type: String
+    NoEcho: true
+    Description: Secret configured on the GitHub webhook for HMAC verification.
+  RunnerLabels:
+    Type: String
+    Default: self-hosted,linux,ecs
+    Description: Comma-separated labels the runner registers with.
+  RunnerCpu:
+    Type: Number
+    Default: 2048
+    Description: CPU units for each Fargate runner task (1024 = 1 vCPU).
+  RunnerMemory:
+    Type: Number
+    Default: 10240
+    Description: Memory (MiB) for each Fargate runner task (hard limit).
+  JobsAcceptanceTimeoutSeconds:
+    Type: Number
+    Default: 180
+    Description: Seconds a runner waits for a job before self-terminating.
+  MaxConcurrentRunners:
+    Type: Number
+    Default: 10
+    Description: Soft cap on concurrent runner tasks.
+  MaxConcurrentLaunches:
+    Type: Number
+    Default: 3
+    Description: >
+      Maximum concurrent invocations of the TaskLauncher Lambda (SQS
+      MaximumConcurrency). Controls rate of RunTask calls.
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    Description: CloudWatch Logs retention in days.
+
+Resources:
+  # ============================================================
+  # KMS Key (shared across ECR, Secrets, Logs, SQS)
+  # ============================================================
+  KmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS Key for GitHub Runner infrastructure
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnableIAMUserPermissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: AllowSecretsManager
+            Effect: Allow
+            Principal:
+              Service: secretsmanager.amazonaws.com
+            Action:
+              - "kms:Encrypt"
+              - "kms:Decrypt"
+              - "kms:ReEncrypt*"
+              - "kms:GenerateDataKey*"
+              - "kms:DescribeKey"
+            Resource: "*"
+          - Sid: AllowCloudWatchLogs
+            Effect: Allow
+            Principal:
+              Service: !Sub "logs.${AWS::Region}.amazonaws.com"
+            Action:
+              - "kms:Encrypt"
+              - "kms:Decrypt"
+              - "kms:ReEncrypt*"
+              - "kms:GenerateDataKey*"
+              - "kms:DescribeKey"
+            Resource: "*"
+            Condition:
+              ArnLike:
+                "kms:EncryptionContext:aws:logs:arn": !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+          - Sid: AllowSQS
+            Effect: Allow
+            Principal:
+              Service: sqs.amazonaws.com
+            Action:
+              - "kms:Encrypt"
+              - "kms:Decrypt"
+              - "kms:ReEncrypt*"
+              - "kms:GenerateDataKey*"
+              - "kms:DescribeKey"
+            Resource: "*"
+
+  # ============================================================
+  # ECR Repository
+  # ============================================================
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref RepositoryName
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      ImageTagMutability: MUTABLE
+      EncryptionConfiguration:
+        EncryptionType: KMS
+        KmsKey: !GetAtt KmsKey.Arn
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep only last 10 untagged images",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": { "type": "expire" }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Keep only last 20 sha-tagged images",
+                "selection": {
+                  "tagStatus": "tagged",
+                  "tagPrefixList": ["sha-"],
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 20
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+      Tags:
+        - Key: Project
+          Value: github-runners
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ============================================================
+  # Secrets Manager
+  # ============================================================
+  GitHubPATSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${EnvironmentName}-github-runner-pat"
+      Description: GitHub PAT for runner self-registration
+      KmsKeyId: !Ref KmsKey
+      SecretString: !Ref GitHubPAT
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  GitHubWebhookSecretSM:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${EnvironmentName}-github-runner-webhook-secret"
+      Description: GitHub webhook signing secret
+      KmsKeyId: !Ref KmsKey
+      SecretString: !Ref GitHubWebhookSecret
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  GitHubBuildTokenSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${EnvironmentName}-github-runner-build-token"
+      Description: GitHub PAT for API rate limit avoidance during Docker builds
+      KmsKeyId: !Ref KmsKey
+      SecretString: !Sub '{"token":"${GitHubBuildToken}"}'
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ============================================================
+  # S3 Bucket for Pipeline Artifacts
+  # ============================================================
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt KmsKey.Arn
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanupOldArtifacts
+            Status: Enabled
+            ExpirationInDays: 7
+      Tags:
+        - Key: Project
+          Value: github-runners
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  ArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt ArtifactBucket.Arn
+              - !Sub '${ArtifactBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  # ============================================================
+  # SQS Queues (rate-control for runner launches)
+  # ============================================================
+  RunnerRequestDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${EnvironmentName}-github-runner-dlq"
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: !GetAtt KmsKey.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  RunnerRequestQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${EnvironmentName}-github-runner-queue"
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 300
+      KmsMasterKeyId: !GetAtt KmsKey.Arn
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt RunnerRequestDLQ.Arn
+        maxReceiveCount: 3
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ============================================================
+  # Networking
+  # ============================================================
+  RunnerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Egress-only SG for ephemeral GitHub runner Fargate tasks
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          FromPort: -1
+          ToPort: -1
+          CidrIp: "0.0.0.0/0"
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ============================================================
+  # Log Groups
+  # ============================================================
+  RunnerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${EnvironmentName}/github-runner"
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !GetAtt KmsKey.Arn
+
+  WebhookReceiverLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${EnvironmentName}-runner-webhook-receiver"
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !GetAtt KmsKey.Arn
+
+  TaskLauncherLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${EnvironmentName}-runner-task-launcher"
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !GetAtt KmsKey.Arn
+
+  # ============================================================
+  # IAM - CodeBuild Service Role
+  # ============================================================
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                Resource:
+                  - !Sub '${ArtifactBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                Resource:
+                  - !GetAtt ECRRepository.Arn
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource:
+                  - !GetAtt KmsKey.Arn
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref GitHubBuildTokenSecret
+
+  # ============================================================
+  # IAM - CodePipeline Service Role
+  # ============================================================
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodePipelinePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:GetBucketVersioning
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub '${ArtifactBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                Resource:
+                  - !GetAtt CodeBuildProject.Arn
+              - Effect: Allow
+                Action:
+                  - codestar-connections:UseConnection
+                Resource:
+                  - !Ref CodeStarConnectionArn
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource:
+                  - !GetAtt KmsKey.Arn
+
+  # ============================================================
+  # IAM - ECS Task Execution Role
+  # ============================================================
+  RunnerTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "EcsGithubRunnerExecutionRole-${EnvironmentName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: KMSDecryptPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["kms:Decrypt", "kms:DescribeKey"]
+                Resource: !GetAtt KmsKey.Arn
+        - PolicyName: SecretsManagerReadPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"]
+                Resource: [!Ref GitHubPATSecret]
+        - PolicyName: CloudWatchLogsWritePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["logs:CreateLogStream", "logs:PutLogEvents"]
+                Resource: !Sub "${RunnerLogGroup.Arn}:*"
+        - PolicyName: ECRPullPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["ecr:GetAuthorizationToken"]
+                Resource: "*"
+              - Effect: Allow
+                Action: ["ecr:BatchCheckLayerAvailability", "ecr:GetDownloadUrlForLayer", "ecr:BatchGetImage"]
+                Resource: !GetAtt ECRRepository.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ============================================================
+  # IAM - ECS Task Role
+  # ============================================================
+  RunnerTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "EcsGithubRunnerTaskRole-${EnvironmentName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ============================================================
+  # IAM - Webhook Receiver Lambda Role
+  # ============================================================
+  WebhookReceiverRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "GithubRunnerWebhookReceiverRole-${EnvironmentName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SQSSendPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["sqs:SendMessage"]
+                Resource: !GetAtt RunnerRequestQueue.Arn
+        - PolicyName: SecretsManagerReadPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["secretsmanager:GetSecretValue"]
+                Resource: [!Ref GitHubWebhookSecretSM]
+              - Effect: Allow
+                Action: ["kms:Decrypt", "kms:DescribeKey", "kms:GenerateDataKey"]
+                Resource: !GetAtt KmsKey.Arn
+        - PolicyName: CloudWatchLogsWritePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["logs:CreateLogStream", "logs:PutLogEvents"]
+                Resource: !Sub "${WebhookReceiverLogGroup.Arn}:*"
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ============================================================
+  # IAM - Task Launcher Lambda Role
+  # ============================================================
+  TaskLauncherRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "GithubRunnerTaskLauncherRole-${EnvironmentName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SQSConsumePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "sqs:ReceiveMessage"
+                  - "sqs:DeleteMessage"
+                  - "sqs:GetQueueAttributes"
+                Resource: !GetAtt RunnerRequestQueue.Arn
+              - Effect: Allow
+                Action: ["kms:Decrypt", "kms:DescribeKey"]
+                Resource: !GetAtt KmsKey.Arn
+        - PolicyName: RunTaskPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["ecs:RunTask"]
+                Resource: !Ref RunnerTaskDefinition
+                Condition:
+                  ArnEquals:
+                    "ecs:cluster": !Sub "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${ECSClusterName}"
+              - Effect: Allow
+                Action: ["ecs:ListTasks"]
+                Resource: "*"
+                Condition:
+                  ArnEquals:
+                    "ecs:cluster": !Sub "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${ECSClusterName}"
+              - Effect: Allow
+                Action: ["iam:PassRole"]
+                Resource:
+                  - !GetAtt RunnerTaskExecutionRole.Arn
+                  - !GetAtt RunnerTaskRole.Arn
+        - PolicyName: CloudWatchLogsWritePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["logs:CreateLogStream", "logs:PutLogEvents"]
+                Resource: !Sub "${TaskLauncherLogGroup.Arn}:*"
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ============================================================
+  # CodeBuild Project
+  # ============================================================
+  CodeBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/codebuild/${EnvironmentName}-github-runner-build"
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !GetAtt KmsKey.Arn
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    DependsOn: [CodeBuildLogGroup]
+    Properties:
+      Name: !Sub "${EnvironmentName}-github-runner-build"
+      Description: Build GitHub Actions self-hosted runner Docker image
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: ECR_REPO_NAME
+            Value: !Ref RepositoryName
+          - Name: GH_RUNNER_VERSION
+            Value: !Ref GHRunnerVersion
+          - Name: ENV_NAME
+            Value: !Ref EnvironmentName
+      LogsConfig:
+        CloudWatchLogs:
+          GroupName: !Ref CodeBuildLogGroup
+          Status: ENABLED
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec.yml
+      TimeoutInMinutes: 30
+      Tags:
+        - Key: Project
+          Value: github-runners
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ============================================================
+  # CodePipeline
+  # ============================================================
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub "${EnvironmentName}-github-runner-pipeline"
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: GitHubSource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: '1'
+              Configuration:
+                ConnectionArn: !Ref CodeStarConnectionArn
+                FullRepositoryId: !Sub '${GitHubOwner}/${GitHubRepo}'
+                BranchName: !Ref GitHubBranch
+                OutputArtifactFormat: CODE_ZIP
+                DetectChanges: true
+              OutputArtifacts:
+                - Name: SourceOutput
+        - Name: Build
+          Actions:
+            - Name: BuildImage
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+
+  # ============================================================
+  # ECS Task Definition
+  # ============================================================
+  RunnerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn: [RunnerLogGroup]
+    Properties:
+      Family: !Sub "${EnvironmentName}-github-runner"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      ExecutionRoleArn: !Ref RunnerTaskExecutionRole
+      TaskRoleArn: !Ref RunnerTaskRole
+      Cpu: !Ref RunnerCpu
+      Memory: !Ref RunnerMemory
+      ContainerDefinitions:
+        - Name: github-runner
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${RepositoryName}:latest"
+          Essential: true
+          Cpu: !Ref RunnerCpu
+          Memory: !Ref RunnerMemory
+          Environment:
+            - Name: EPHEMERAL
+              Value: 'true'
+            - Name: DISABLE_AUTO_UPDATE
+              Value: 'true'
+            - Name: LABELS
+              Value: !Ref RunnerLabels
+            - Name: RUNNER_SCOPE
+              Value: org
+            - Name: ORG_NAME
+              Value: !Ref GitHubOrg
+            - Name: JOBS_ACCEPTANCE_TIMEOUT
+              Value: !Ref JobsAcceptanceTimeoutSeconds
+          Secrets:
+            - Name: ACCESS_TOKEN
+              ValueFrom: !Ref GitHubPATSecret
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref RunnerLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: runner
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ============================================================
+  # Lambda - Webhook Receiver
+  # ============================================================
+  WebhookReceiverFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: [WebhookReceiverLogGroup]
+    Properties:
+      FunctionName: !Sub "${EnvironmentName}-runner-webhook-receiver"
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt WebhookReceiverRole.Arn
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          QUEUE_URL: !Ref RunnerRequestQueue
+          WEBHOOK_SECRET_ARN: !Ref GitHubWebhookSecretSM
+      Code:
+        ZipFile: |
+          import json
+          import hmac
+          import hashlib
+          import os
+          import boto3
+
+          sqs = boto3.client('sqs')
+          secretsmanager = boto3.client('secretsmanager')
+
+          QUEUE_URL = os.environ['QUEUE_URL']
+          WEBHOOK_SECRET_ARN = os.environ['WEBHOOK_SECRET_ARN']
+          _cached_secret = None
+
+
+          def _get_webhook_secret():
+              global _cached_secret
+              if _cached_secret is None:
+                  resp = secretsmanager.get_secret_value(SecretId=WEBHOOK_SECRET_ARN)
+                  _cached_secret = resp['SecretString']
+              return _cached_secret
+
+
+          def _verify_signature(body_bytes, signature_header):
+              if not signature_header or not signature_header.startswith('sha256='):
+                  return False
+              secret = _get_webhook_secret().encode('utf-8')
+              expected = 'sha256=' + hmac.HMAC(secret, body_bytes, hashlib.sha256).hexdigest()
+              return hmac.compare_digest(expected, signature_header)
+
+
+          def handler(event, context):
+              headers = {k.lower(): v for k, v in (event.get('headers') or {}).items()}
+              raw_body = event.get('body') or ''
+              if event.get('isBase64Encoded'):
+                  import base64
+                  body_bytes = base64.b64decode(raw_body)
+              else:
+                  body_bytes = raw_body.encode('utf-8')
+
+              signature = headers.get('x-hub-signature-256')
+              if not _verify_signature(body_bytes, signature):
+                  return {'statusCode': 401, 'body': 'invalid signature'}
+
+              github_event = headers.get('x-github-event')
+              if github_event != 'workflow_job':
+                  return {'statusCode': 200, 'body': 'ignored (not workflow_job)'}
+
+              payload = json.loads(body_bytes.decode('utf-8'))
+              action = payload.get('action')
+              # Process 'queued' (normal) and 'waiting' (jobs with needs: that are ready)
+              if action not in ('queued', 'waiting'):
+                  return {'statusCode': 200, 'body': f'ignored (action={action})'}
+
+              workflow_job = payload.get('workflow_job', {})
+              job_name = workflow_job.get('name', 'unknown')
+              print(f"Processing {action} event for job: {job_name} (id: {workflow_job.get('id')})")
+
+              sqs.send_message(
+                  QueueUrl=QUEUE_URL,
+                  MessageBody=json.dumps({
+                      'action': action,
+                      'workflow_job_id': workflow_job.get('id'),
+                      'job_name': job_name,
+                  }),
+                  # Deduplicate: if both queued and waiting arrive for same job,
+                  # SQS will only process one (using MessageGroupId with FIFO would be ideal,
+                  # but with standard queue we accept the small chance of a duplicate runner)
+              )
+              return {'statusCode': 200, 'body': f'{action} for runner launch ({job_name})'}
+
+  # ============================================================
+  # Lambda - Task Launcher
+  # ============================================================
+  TaskLauncherFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: [TaskLauncherLogGroup]
+    Properties:
+      FunctionName: !Sub "${EnvironmentName}-runner-task-launcher"
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt TaskLauncherRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          CLUSTER_NAME: !Ref ECSClusterName
+          TASK_DEFINITION_ARN: !Ref RunnerTaskDefinition
+          MAX_CONCURRENT_RUNNERS: !Ref MaxConcurrentRunners
+          SUBNET_IDS: !Join [",", !Ref SubnetIds]
+          SECURITY_GROUP_ID: !Ref RunnerSecurityGroup
+          ASSIGN_PUBLIC_IP: !Ref AssignPublicIp
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+
+          ecs = boto3.client('ecs')
+
+          CLUSTER_NAME = os.environ['CLUSTER_NAME']
+          TASK_DEFINITION_ARN = os.environ['TASK_DEFINITION_ARN']
+          MAX_CONCURRENT_RUNNERS = int(os.environ['MAX_CONCURRENT_RUNNERS'])
+          SUBNET_IDS = os.environ['SUBNET_IDS'].split(',')
+          SECURITY_GROUP_ID = os.environ['SECURITY_GROUP_ID']
+          ASSIGN_PUBLIC_IP = os.environ['ASSIGN_PUBLIC_IP']
+
+
+          def _running_runner_count():
+              paginator = ecs.get_paginator('list_tasks')
+              count = 0
+              for page in paginator.paginate(
+                  cluster=CLUSTER_NAME,
+                  family=TASK_DEFINITION_ARN.split('/')[-1].split(':')[0],
+                  desiredStatus='RUNNING',
+              ):
+                  count += len(page.get('taskArns', []))
+              return count
+
+
+          def handler(event, context):
+              for record in event.get('Records', []):
+                  body = json.loads(record['body'])
+                  print(f"Processing queued request: {body}")
+
+                  current = _running_runner_count()
+                  if current >= MAX_CONCURRENT_RUNNERS:
+                      print(f'At soft cap ({current}/{MAX_CONCURRENT_RUNNERS}), skipping')
+                      continue
+
+                  resp = ecs.run_task(
+                      cluster=CLUSTER_NAME,
+                      taskDefinition=TASK_DEFINITION_ARN,
+                      count=1,
+                      launchType='FARGATE',
+                      networkConfiguration={
+                          'awsvpcConfiguration': {
+                              'subnets': SUBNET_IDS,
+                              'securityGroups': [SECURITY_GROUP_ID],
+                              'assignPublicIp': ASSIGN_PUBLIC_IP,
+                          }
+                      },
+                  )
+                  failures = resp.get('failures', [])
+                  if failures:
+                      print(f"RunTask failures: {failures}")
+                      raise Exception(f"RunTask failed: {failures[0].get('reason')}")
+
+                  print(f"Task launched: {resp['tasks'][0]['taskArn']}")
+
+  # SQS -> Lambda Event Source Mapping
+  TaskLauncherEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt RunnerRequestQueue.Arn
+      FunctionName: !Ref TaskLauncherFunction
+      BatchSize: 1
+      MaximumBatchingWindowInSeconds: 0
+      ScalingConfig:
+        MaximumConcurrency: !Ref MaxConcurrentLaunches
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+
+  # ============================================================
+  # API Gateway (Webhook endpoint)
+  # ============================================================
+  WebhookApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${EnvironmentName}-github-runner-webhook"
+      ProtocolType: HTTP
+
+  WebhookApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebhookApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt WebhookReceiverFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  WebhookApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebhookApi
+      RouteKey: "POST /webhook"
+      Target: !Sub "integrations/${WebhookApiIntegration}"
+
+  WebhookApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/${EnvironmentName}-github-runner-webhook"
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !GetAtt KmsKey.Arn
+
+  WebhookApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref WebhookApi
+      StageName: "$default"
+      AutoDeploy: true
+      AccessLogSettings:
+        DestinationArn: !GetAtt WebhookApiAccessLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","requestTime":"$context.requestTime","httpMethod":"$context.httpMethod","routeKey":"$context.routeKey","status":"$context.status","protocol":"$context.protocol","responseLength":"$context.responseLength","integrationError":"$context.integrationErrorMessage"}'
+
+  WebhookApiLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref WebhookReceiverFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebhookApi}/*/*/webhook"
+
+# ============================================================
+# Outputs
+# ============================================================
+Outputs:
+  ECRRepositoryUri:
+    Description: URI of the ECR repository for the runner image.
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${RepositoryName}'
+
+  ECRRepositoryArn:
+    Description: ARN of the ECR repository.
+    Value: !GetAtt ECRRepository.Arn
+
+  PipelineName:
+    Description: Name of the CodePipeline.
+    Value: !Ref Pipeline
+
+  CodeBuildProjectName:
+    Description: Name of the CodeBuild project.
+    Value: !Ref CodeBuildProject
+
+  WebhookUrl:
+    Description: >
+      Payload URL for the org-level GitHub webhook (content type
+      application/json, event "Workflow jobs" only).
+    Value: !Sub "https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/webhook"
+
+  RunnerTaskDefinitionArn:
+    Description: ARN of the ECS task definition for ephemeral runners.
+    Value: !Ref RunnerTaskDefinition
+
+  RunnerLogGroupName:
+    Description: CloudWatch Logs group for runner container output.
+    Value: !Ref RunnerLogGroup
+
+  QueueUrl:
+    Description: SQS queue URL for runner launch requests.
+    Value: !Ref RunnerRequestQueue
+
+  DLQUrl:
+    Description: Dead-letter queue for failed runner launch requests.
+    Value: !Ref RunnerRequestDLQ

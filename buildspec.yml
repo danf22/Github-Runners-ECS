@@ -1,0 +1,41 @@
+version: 0.2
+
+env:
+  variables:
+    GH_RUNNER_VERSION: "2.336.0"
+
+phases:
+  pre_build:
+    commands:
+      - echo Logging in to Amazon ECR...
+      - AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+      - AWS_REGION=${AWS_DEFAULT_REGION}
+      - ECR_URI=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+      - aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_URI}
+      - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+      - IMAGE_TAG=${COMMIT_HASH:-latest}
+      - echo Fetching GitHub build token...
+      - GITHUB_TOKEN=$(aws secretsmanager get-secret-value --secret-id ${ENV_NAME}-github-runner-build-token --query SecretString --output text | jq -r .token 2>/dev/null || echo "")
+
+  build:
+    commands:
+      - echo Building base image...
+      - docker build -f Dockerfile.base
+          --build-arg GITHUB_TOKEN=${GITHUB_TOKEN:-}
+          -t github-runner-base:latest .
+      - echo Building runner image...
+      - docker build
+          --build-arg BASE_IMAGE=github-runner-base:latest
+          --build-arg GH_RUNNER_VERSION=${GH_RUNNER_VERSION}
+          -t ${ECR_URI}/${ECR_REPO_NAME}:${IMAGE_TAG}
+          -t ${ECR_URI}/${ECR_REPO_NAME}:${GH_RUNNER_VERSION}
+          -t ${ECR_URI}/${ECR_REPO_NAME}:latest
+          .
+
+  post_build:
+    commands:
+      - echo Pushing images to ECR...
+      - docker push ${ECR_URI}/${ECR_REPO_NAME}:${IMAGE_TAG}
+      - docker push ${ECR_URI}/${ECR_REPO_NAME}:${GH_RUNNER_VERSION}
+      - docker push ${ECR_URI}/${ECR_REPO_NAME}:latest
+      - echo Build completed on $(date)
