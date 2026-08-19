@@ -86,7 +86,7 @@ Parameters:
     Description: Memory (MiB) for each Fargate runner task (hard limit).
   JobsAcceptanceTimeoutSeconds:
     Type: Number
-    Default: 180
+    Default: 300
     Description: Seconds a runner waits for a job before self-terminating.
   MaxConcurrentRunners:
     Type: Number
@@ -102,6 +102,13 @@ Parameters:
     Type: Number
     Default: 14
     Description: CloudWatch Logs retention in days.
+  AlertEmail:
+    Type: String
+    Default: ''
+    Description: Email address for infrastructure alerts (SQS message age, DLQ messages). Must be confirmed after deploy.
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
 
 Resources:
   # ============================================================
@@ -309,12 +316,116 @@ Resources:
           Value: !Ref EnvironmentName
 
   # ============================================================
+  # SNS Topic for Alerts
+  # ============================================================
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${EnvironmentName}-github-runner-alerts"
+      KmsMasterKeyId: !GetAtt KmsKey.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  AlertsSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ============================================================
+  # CloudWatch Alarms (SQS Message Age Monitoring - Drata Test 115)
+  # ============================================================
+  QueueMessageAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${EnvironmentName}-sqs-runner-queue-message-age"
+      AlarmDescription: >
+        Alert when messages in the runner request queue are older than 5 minutes.
+        This indicates runners are not picking up jobs in time.
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt RunnerRequestQueue.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 300
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+      TreatMissingData: notBreaching
+
+  DLQMessageCountAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${EnvironmentName}-sqs-runner-dlq-messages"
+      AlarmDescription: >
+        Alert when messages appear in the dead-letter queue.
+        This indicates repeated failures in launching runner tasks.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt RunnerRequestDLQ.QueueName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlertsTopic
+      TreatMissingData: notBreaching
+
+  DLQMessageAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${EnvironmentName}-sqs-runner-dlq-message-age"
+      AlarmDescription: >
+        Alert when messages in the DLQ are older than 10 minutes.
+        Drata Test 115 compliance - message age monitored on all queues.
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt RunnerRequestDLQ.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 600
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+      TreatMissingData: notBreaching
+
+  # ============================================================
   # Networking
   # ============================================================
   RunnerSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupDescription: Egress-only SG for ephemeral GitHub runner Fargate tasks
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          FromPort: -1
+          ToPort: -1
+          CidrIp: "0.0.0.0/0"
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  CodeBuildSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Egress-only SG for CodeBuild project running in VPC
       VpcId: !Ref VpcId
       SecurityGroupEgress:
         - IpProtocol: -1
@@ -407,6 +518,17 @@ Resources:
                   - secretsmanager:GetSecretValue
                 Resource:
                   - !Ref GitHubBuildTokenSecret
+              - Effect: Allow
+                Action:
+                  - ec2:CreateNetworkInterface
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DeleteNetworkInterface
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeDhcpOptions
+                  - ec2:DescribeVpcs
+                  - ec2:CreateNetworkInterfacePermission
+                Resource: '*'
 
   # ============================================================
   # IAM - CodePipeline Service Role
@@ -655,6 +777,11 @@ Resources:
             Value: !Ref GHRunnerVersion
           - Name: ENV_NAME
             Value: !Ref EnvironmentName
+      VpcConfig:
+        VpcId: !Ref VpcId
+        Subnets: !Ref SubnetIds
+        SecurityGroupIds:
+          - !Ref CodeBuildSecurityGroup
       LogsConfig:
         CloudWatchLogs:
           GroupName: !Ref CodeBuildLogGroup
