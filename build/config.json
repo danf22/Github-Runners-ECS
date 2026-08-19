@@ -110,13 +110,6 @@
         "python3-setuptools",
         "python3-venv"
       ]
-    },
-    {
-      "category": "yq",
-      "source": "script",
-      "packages": [
-        "yq"
-      ]
     }
   ]
 }
