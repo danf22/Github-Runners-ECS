@@ -281,8 +281,8 @@ if [[ ${_JOBS_ACCEPTANCE_TIMEOUT} -gt 0 ]] && [[ -n "${EPHEMERAL}" ]]; then
     # Check if runner is still idle (Worker dir is empty when no job is running)
     if [[ ! -d "/actions-runner/_work/_temp" ]] || [[ -z "$(ls -A /actions-runner/_work/_temp 2>/dev/null)" ]]; then
       echo "WARNING: Runner idle for ${_JOBS_ACCEPTANCE_TIMEOUT}s without picking up a job. Terminating."
-      kill -TERM $$ 2>/dev/null || kill -TERM 1 2>/dev/null
-    fi
+      # Kill PID 1 (dumb-init) to terminate the container
+    kill -TERM 1
   ) &
   _WATCHDOG_PID=$!
 fi
